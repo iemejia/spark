@@ -92,6 +92,12 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
   private ByteBuffer vectorsData;
   private int offsetArraySize;
 
+  // Backing byte array for vectorsData (null if direct buffer).
+  // Using byte[] with the generated packer's array overload avoids ByteBuffer bounds-checking
+  // overhead in the unpack hot path.
+  private byte[] vectorsArray;
+  private int vectorsArrayBase;
+
   // Current position
   private int currentIndex;
 
@@ -177,6 +183,15 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
     int remainingBytes = (int) stream.available();
     ByteBuffer rawSlice = stream.slice(remainingBytes);
     this.vectorsData = rawSlice.slice().order(ByteOrder.LITTLE_ENDIAN);
+
+    // Extract backing array for faster unpack access (avoids ByteBuffer bounds checking)
+    if (this.vectorsData.hasArray()) {
+      this.vectorsArray = this.vectorsData.array();
+      this.vectorsArrayBase = this.vectorsData.arrayOffset() + this.vectorsData.position();
+    } else {
+      this.vectorsArray = null;
+      this.vectorsArrayBase = 0;
+    }
 
     // Allocate decode buffers
     allocateBuffers();
@@ -328,19 +343,18 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
     int bitWidth = vectorsData.get(pos + 4) & 0xFF;
     pos += FLOAT_FOR_INFO_SIZE;
 
-    // Unpack bit-packed deltas
-    if (bitWidth > 0) {
-      pos = unpackInts(vectorsData, pos, intDeltasBuffer, vectorLen, bitWidth);
-    } else {
-      java.util.Arrays.fill(intDeltasBuffer, 0, vectorLen, 0);
-    }
-
-    // Decode: (delta + FOR) * POW10[factor] * POW10_NEGATIVE[exponent]
+    // Unpack bit-packed deltas and decode
     float pow10f = FLOAT_POW10[factor];
     float pow10ne = FLOAT_POW10_NEGATIVE[exponent];
-    for (int i = 0; i < vectorLen; i++) {
-      int encoded = intDeltasBuffer[i] + frameOfReference;
-      decodedFloats[i] = encoded * pow10f * pow10ne;
+    if (bitWidth > 0) {
+      pos = unpackInts(vectorsData, pos, intDeltasBuffer, vectorLen, bitWidth);
+      for (int i = 0; i < vectorLen; i++) {
+        decodedFloats[i] = (intDeltasBuffer[i] + frameOfReference) * pow10f * pow10ne;
+      }
+    } else {
+      // bitWidth=0: all deltas are zero, all values decode to the same result
+      float value = frameOfReference * pow10f * pow10ne;
+      java.util.Arrays.fill(decodedFloats, 0, vectorLen, value);
     }
 
     // Apply exceptions: overwrite positions with raw float values
@@ -375,19 +389,18 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
     int bitWidth = vectorsData.get(pos + 8) & 0xFF;
     pos += DOUBLE_FOR_INFO_SIZE;
 
-    // Unpack bit-packed deltas
-    if (bitWidth > 0) {
-      pos = unpackLongs(vectorsData, pos, longDeltasBuffer, vectorLen, bitWidth);
-    } else {
-      java.util.Arrays.fill(longDeltasBuffer, 0, vectorLen, 0L);
-    }
-
-    // Decode: (delta + FOR) * POW10[factor] * POW10_NEGATIVE[exponent]
+    // Unpack bit-packed deltas and decode
     double pow10f = DOUBLE_POW10[factor];
     double pow10ne = DOUBLE_POW10_NEGATIVE[exponent];
-    for (int i = 0; i < vectorLen; i++) {
-      long encoded = longDeltasBuffer[i] + frameOfReference;
-      decodedDoubles[i] = encoded * pow10f * pow10ne;
+    if (bitWidth > 0) {
+      pos = unpackLongs(vectorsData, pos, longDeltasBuffer, vectorLen, bitWidth);
+      for (int i = 0; i < vectorLen; i++) {
+        decodedDoubles[i] = (longDeltasBuffer[i] + frameOfReference) * pow10f * pow10ne;
+      }
+    } else {
+      // bitWidth=0: all deltas are zero, all values decode to the same result
+      double value = frameOfReference * pow10f * pow10ne;
+      java.util.Arrays.fill(decodedDoubles, 0, vectorLen, value);
     }
 
     // Apply exceptions: overwrite positions with raw double values
@@ -407,6 +420,8 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
 
   /**
    * Unpack bit-packed int values using unpack32Values for the bulk and unpack8Values for the tail.
+   * When a backing byte array is available, uses the byte[] overload to avoid ByteBuffer
+   * bounds-checking overhead in the hot loop.
    * Returns the position after all packed data.
    */
   private int unpackInts(ByteBuffer buf, int pos, int[] output, int count, int bitWidth) {
@@ -414,58 +429,43 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
     int numGroups32 = count / 32;
     int remaining = count - numGroups32 * 32;
 
-    // Process 32 values at a time
-    for (int g = 0; g < numGroups32; g++) {
-      packer.unpack32Values(buf, pos, output, g * 32);
-      pos += bitWidth * 4;
-    }
+    if (vectorsArray != null) {
+      int arrayPos = vectorsArrayBase + pos;
 
-    // Process remaining in groups of 8
-    int offset = numGroups32 * 32;
-    int numGroups8 = remaining / 8;
-    int tail = remaining - numGroups8 * 8;
-
-    for (int g = 0; g < numGroups8; g++) {
-      packer.unpack8Values(buf, pos, output, offset + g * 8);
-      pos += bitWidth;
-    }
-
-    // Handle partial last group: zero-pad byte buffer, unpack, copy only valid values
-    if (tail > 0) {
-      int totalPackedBytes = (count * bitWidth + 7) / 8;
-      int alreadyRead = (numGroups32 * 4 + numGroups8) * bitWidth;
-      int partialBytes = totalPackedBytes - alreadyRead;
-
-      for (int i = 0; i < partialBytes; i++) {
-        unpackByteBuf[i] = buf.get(pos + i);
-      }
-      for (int i = partialBytes; i < bitWidth; i++) {
-        unpackByteBuf[i] = 0;
+      // Process 32 values at a time using byte[] overload
+      for (int g = 0; g < numGroups32; g++) {
+        packer.unpack32Values(vectorsArray, arrayPos, output, g * 32);
+        arrayPos += bitWidth * 4;
       }
 
-      packer.unpack8Values(unpackByteBuf, 0, intUnpackPadBuf, 0);
-      System.arraycopy(intUnpackPadBuf, 0, output, offset + numGroups8 * 8, tail);
-      pos += partialBytes;
-    }
+      // Process remaining in groups of 8
+      int offset = numGroups32 * 32;
+      int numGroups8 = remaining / 8;
+      int tail = remaining - numGroups8 * 8;
 
-    return pos;
-  }
+      for (int g = 0; g < numGroups8; g++) {
+        packer.unpack8Values(vectorsArray, arrayPos, output, offset + g * 8);
+        arrayPos += bitWidth;
+      }
 
-  /**
-   * Unpack bit-packed long values using BytePackerForLong.
-   * For narrow bit-widths (<=32), uses unpack32Values for better throughput.
-   * For wide bit-widths (>32), uses unpack8Values which performs better due to
-   * reduced per-call memory traffic in the ByteBuffer read path.
-   * Returns the position after all packed data.
-   */
-  private int unpackLongs(ByteBuffer buf, int pos, long[] output, int count, int bitWidth) {
-    BytePackerForLong packer = Packer.LITTLE_ENDIAN.newBytePackerForLong(bitWidth);
+      if (tail > 0) {
+        int totalPackedBytes = (count * bitWidth + 7) / 8;
+        int alreadyRead = (numGroups32 * 4 + numGroups8) * bitWidth;
+        int partialBytes = totalPackedBytes - alreadyRead;
 
-    if (bitWidth <= 32) {
-      // Narrow bit-widths: unpack32 reduces loop overhead significantly
-      int numGroups32 = count / 32;
-      int remaining = count - numGroups32 * 32;
+        System.arraycopy(vectorsArray, arrayPos, unpackByteBuf, 0, partialBytes);
+        for (int i = partialBytes; i < bitWidth; i++) {
+          unpackByteBuf[i] = 0;
+        }
 
+        packer.unpack8Values(unpackByteBuf, 0, intUnpackPadBuf, 0);
+        System.arraycopy(intUnpackPadBuf, 0, output, offset + numGroups8 * 8, tail);
+        arrayPos += partialBytes;
+      }
+
+      pos = arrayPos - vectorsArrayBase;
+    } else {
+      // Fallback: ByteBuffer path for direct buffers
       for (int g = 0; g < numGroups32; g++) {
         packer.unpack32Values(buf, pos, output, g * 32);
         pos += bitWidth * 4;
@@ -492,35 +492,148 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
           unpackByteBuf[i] = 0;
         }
 
-        packer.unpack8Values(unpackByteBuf, 0, longUnpackPadBuf, 0);
-        System.arraycopy(longUnpackPadBuf, 0, output, offset + numGroups8 * 8, tail);
+        packer.unpack8Values(unpackByteBuf, 0, intUnpackPadBuf, 0);
+        System.arraycopy(intUnpackPadBuf, 0, output, offset + numGroups8 * 8, tail);
         pos += partialBytes;
       }
+    }
+
+    return pos;
+  }
+
+  /**
+   * Unpack bit-packed long values using BytePackerForLong.
+   * For narrow bit-widths (<=32), uses unpack32Values for better throughput.
+   * For wide bit-widths (>32), uses unpack8Values which performs better due to
+   * reduced per-call memory traffic in the ByteBuffer read path.
+   * When a backing byte array is available, uses the byte[] overload.
+   * Returns the position after all packed data.
+   */
+  private int unpackLongs(ByteBuffer buf, int pos, long[] output, int count, int bitWidth) {
+    BytePackerForLong packer = Packer.LITTLE_ENDIAN.newBytePackerForLong(bitWidth);
+
+    if (vectorsArray != null) {
+      int arrayPos = vectorsArrayBase + pos;
+
+      if (bitWidth <= 32) {
+        int numGroups32 = count / 32;
+        int remaining = count - numGroups32 * 32;
+
+        for (int g = 0; g < numGroups32; g++) {
+          packer.unpack32Values(vectorsArray, arrayPos, output, g * 32);
+          arrayPos += bitWidth * 4;
+        }
+
+        int offset = numGroups32 * 32;
+        int numGroups8 = remaining / 8;
+        int tail = remaining - numGroups8 * 8;
+
+        for (int g = 0; g < numGroups8; g++) {
+          packer.unpack8Values(vectorsArray, arrayPos, output, offset + g * 8);
+          arrayPos += bitWidth;
+        }
+
+        if (tail > 0) {
+          int totalPackedBytes = (count * bitWidth + 7) / 8;
+          int alreadyRead = (numGroups32 * 4 + numGroups8) * bitWidth;
+          int partialBytes = totalPackedBytes - alreadyRead;
+
+          System.arraycopy(vectorsArray, arrayPos, unpackByteBuf, 0, partialBytes);
+          for (int i = partialBytes; i < bitWidth; i++) {
+            unpackByteBuf[i] = 0;
+          }
+
+          packer.unpack8Values(unpackByteBuf, 0, longUnpackPadBuf, 0);
+          System.arraycopy(longUnpackPadBuf, 0, output, offset + numGroups8 * 8, tail);
+          arrayPos += partialBytes;
+        }
+      } else {
+        int numFullGroups = count / 8;
+        int remaining = count % 8;
+
+        for (int g = 0; g < numFullGroups; g++) {
+          packer.unpack8Values(vectorsArray, arrayPos, output, g * 8);
+          arrayPos += bitWidth;
+        }
+
+        if (remaining > 0) {
+          int totalPackedBytes = (count * bitWidth + 7) / 8;
+          int alreadyRead = numFullGroups * bitWidth;
+          int partialBytes = totalPackedBytes - alreadyRead;
+
+          System.arraycopy(vectorsArray, arrayPos, unpackByteBuf, 0, partialBytes);
+          for (int i = partialBytes; i < bitWidth; i++) {
+            unpackByteBuf[i] = 0;
+          }
+
+          packer.unpack8Values(unpackByteBuf, 0, longUnpackPadBuf, 0);
+          System.arraycopy(longUnpackPadBuf, 0, output, numFullGroups * 8, remaining);
+          arrayPos += partialBytes;
+        }
+      }
+
+      pos = arrayPos - vectorsArrayBase;
     } else {
-      // Wide bit-widths: unpack8 is more efficient
-      int numFullGroups = count / 8;
-      int remaining = count % 8;
+      // Fallback: ByteBuffer path for direct buffers
+      if (bitWidth <= 32) {
+        int numGroups32 = count / 32;
+        int remaining = count - numGroups32 * 32;
 
-      for (int g = 0; g < numFullGroups; g++) {
-        packer.unpack8Values(buf, pos, output, g * 8);
-        pos += bitWidth;
-      }
-
-      if (remaining > 0) {
-        int totalPackedBytes = (count * bitWidth + 7) / 8;
-        int alreadyRead = numFullGroups * bitWidth;
-        int partialBytes = totalPackedBytes - alreadyRead;
-
-        for (int i = 0; i < partialBytes; i++) {
-          unpackByteBuf[i] = buf.get(pos + i);
-        }
-        for (int i = partialBytes; i < bitWidth; i++) {
-          unpackByteBuf[i] = 0;
+        for (int g = 0; g < numGroups32; g++) {
+          packer.unpack32Values(buf, pos, output, g * 32);
+          pos += bitWidth * 4;
         }
 
-        packer.unpack8Values(unpackByteBuf, 0, longUnpackPadBuf, 0);
-        System.arraycopy(longUnpackPadBuf, 0, output, numFullGroups * 8, remaining);
-        pos += partialBytes;
+        int offset = numGroups32 * 32;
+        int numGroups8 = remaining / 8;
+        int tail = remaining - numGroups8 * 8;
+
+        for (int g = 0; g < numGroups8; g++) {
+          packer.unpack8Values(buf, pos, output, offset + g * 8);
+          pos += bitWidth;
+        }
+
+        if (tail > 0) {
+          int totalPackedBytes = (count * bitWidth + 7) / 8;
+          int alreadyRead = (numGroups32 * 4 + numGroups8) * bitWidth;
+          int partialBytes = totalPackedBytes - alreadyRead;
+
+          for (int i = 0; i < partialBytes; i++) {
+            unpackByteBuf[i] = buf.get(pos + i);
+          }
+          for (int i = partialBytes; i < bitWidth; i++) {
+            unpackByteBuf[i] = 0;
+          }
+
+          packer.unpack8Values(unpackByteBuf, 0, longUnpackPadBuf, 0);
+          System.arraycopy(longUnpackPadBuf, 0, output, offset + numGroups8 * 8, tail);
+          pos += partialBytes;
+        }
+      } else {
+        int numFullGroups = count / 8;
+        int remaining = count % 8;
+
+        for (int g = 0; g < numFullGroups; g++) {
+          packer.unpack8Values(buf, pos, output, g * 8);
+          pos += bitWidth;
+        }
+
+        if (remaining > 0) {
+          int totalPackedBytes = (count * bitWidth + 7) / 8;
+          int alreadyRead = numFullGroups * bitWidth;
+          int partialBytes = totalPackedBytes - alreadyRead;
+
+          for (int i = 0; i < partialBytes; i++) {
+            unpackByteBuf[i] = buf.get(pos + i);
+          }
+          for (int i = partialBytes; i < bitWidth; i++) {
+            unpackByteBuf[i] = 0;
+          }
+
+          packer.unpack8Values(unpackByteBuf, 0, longUnpackPadBuf, 0);
+          System.arraycopy(longUnpackPadBuf, 0, output, numFullGroups * 8, remaining);
+          pos += partialBytes;
+        }
       }
     }
 
