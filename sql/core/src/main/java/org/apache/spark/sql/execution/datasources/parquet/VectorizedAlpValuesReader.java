@@ -233,9 +233,7 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
       int availableInVector = currentVectorLen - indexInVector;
       int toRead = Math.min(remaining, availableInVector);
 
-      for (int i = 0; i < toRead; i++) {
-        c.putFloat(rowId + i, decodedFloats[indexInVector + i]);
-      }
+      c.putFloats(rowId, toRead, decodedFloats, indexInVector);
 
       currentIndex += toRead;
       rowId += toRead;
@@ -253,9 +251,7 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
       int availableInVector = currentVectorLen - indexInVector;
       int toRead = Math.min(remaining, availableInVector);
 
-      for (int i = 0; i < toRead; i++) {
-        c.putDouble(rowId + i, decodedDoubles[indexInVector + i]);
-      }
+      c.putDoubles(rowId, toRead, decodedDoubles, indexInVector);
 
       currentIndex += toRead;
       rowId += toRead;
@@ -410,23 +406,34 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
   // ======================== Bit unpacking ========================
 
   /**
-   * Unpack bit-packed int values in groups of 8 using BytePacker.
+   * Unpack bit-packed int values using unpack32Values for the bulk and unpack8Values for the tail.
    * Returns the position after all packed data.
    */
   private int unpackInts(ByteBuffer buf, int pos, int[] output, int count, int bitWidth) {
     BytePacker packer = Packer.LITTLE_ENDIAN.newBytePacker(bitWidth);
-    int numFullGroups = count / 8;
-    int remaining = count % 8;
+    int numGroups32 = count / 32;
+    int remaining = count - numGroups32 * 32;
 
-    for (int g = 0; g < numFullGroups; g++) {
-      packer.unpack8Values(buf, pos, output, g * 8);
+    // Process 32 values at a time
+    for (int g = 0; g < numGroups32; g++) {
+      packer.unpack32Values(buf, pos, output, g * 32);
+      pos += bitWidth * 4;
+    }
+
+    // Process remaining in groups of 8
+    int offset = numGroups32 * 32;
+    int numGroups8 = remaining / 8;
+    int tail = remaining - numGroups8 * 8;
+
+    for (int g = 0; g < numGroups8; g++) {
+      packer.unpack8Values(buf, pos, output, offset + g * 8);
       pos += bitWidth;
     }
 
     // Handle partial last group: zero-pad byte buffer, unpack, copy only valid values
-    if (remaining > 0) {
+    if (tail > 0) {
       int totalPackedBytes = (count * bitWidth + 7) / 8;
-      int alreadyRead = numFullGroups * bitWidth;
+      int alreadyRead = (numGroups32 * 4 + numGroups8) * bitWidth;
       int partialBytes = totalPackedBytes - alreadyRead;
 
       for (int i = 0; i < partialBytes; i++) {
@@ -437,7 +444,7 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
       }
 
       packer.unpack8Values(unpackByteBuf, 0, intUnpackPadBuf, 0);
-      System.arraycopy(intUnpackPadBuf, 0, output, numFullGroups * 8, remaining);
+      System.arraycopy(intUnpackPadBuf, 0, output, offset + numGroups8 * 8, tail);
       pos += partialBytes;
     }
 
@@ -445,35 +452,76 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
   }
 
   /**
-   * Unpack bit-packed long values in groups of 8 using BytePackerForLong.
+   * Unpack bit-packed long values using BytePackerForLong.
+   * For narrow bit-widths (<=32), uses unpack32Values for better throughput.
+   * For wide bit-widths (>32), uses unpack8Values which performs better due to
+   * reduced per-call memory traffic in the ByteBuffer read path.
    * Returns the position after all packed data.
    */
   private int unpackLongs(ByteBuffer buf, int pos, long[] output, int count, int bitWidth) {
     BytePackerForLong packer = Packer.LITTLE_ENDIAN.newBytePackerForLong(bitWidth);
-    int numFullGroups = count / 8;
-    int remaining = count % 8;
 
-    for (int g = 0; g < numFullGroups; g++) {
-      packer.unpack8Values(buf, pos, output, g * 8);
-      pos += bitWidth;
-    }
+    if (bitWidth <= 32) {
+      // Narrow bit-widths: unpack32 reduces loop overhead significantly
+      int numGroups32 = count / 32;
+      int remaining = count - numGroups32 * 32;
 
-    // Handle partial last group
-    if (remaining > 0) {
-      int totalPackedBytes = (count * bitWidth + 7) / 8;
-      int alreadyRead = numFullGroups * bitWidth;
-      int partialBytes = totalPackedBytes - alreadyRead;
-
-      for (int i = 0; i < partialBytes; i++) {
-        unpackByteBuf[i] = buf.get(pos + i);
-      }
-      for (int i = partialBytes; i < bitWidth; i++) {
-        unpackByteBuf[i] = 0;
+      for (int g = 0; g < numGroups32; g++) {
+        packer.unpack32Values(buf, pos, output, g * 32);
+        pos += bitWidth * 4;
       }
 
-      packer.unpack8Values(unpackByteBuf, 0, longUnpackPadBuf, 0);
-      System.arraycopy(longUnpackPadBuf, 0, output, numFullGroups * 8, remaining);
-      pos += partialBytes;
+      int offset = numGroups32 * 32;
+      int numGroups8 = remaining / 8;
+      int tail = remaining - numGroups8 * 8;
+
+      for (int g = 0; g < numGroups8; g++) {
+        packer.unpack8Values(buf, pos, output, offset + g * 8);
+        pos += bitWidth;
+      }
+
+      if (tail > 0) {
+        int totalPackedBytes = (count * bitWidth + 7) / 8;
+        int alreadyRead = (numGroups32 * 4 + numGroups8) * bitWidth;
+        int partialBytes = totalPackedBytes - alreadyRead;
+
+        for (int i = 0; i < partialBytes; i++) {
+          unpackByteBuf[i] = buf.get(pos + i);
+        }
+        for (int i = partialBytes; i < bitWidth; i++) {
+          unpackByteBuf[i] = 0;
+        }
+
+        packer.unpack8Values(unpackByteBuf, 0, longUnpackPadBuf, 0);
+        System.arraycopy(longUnpackPadBuf, 0, output, offset + numGroups8 * 8, tail);
+        pos += partialBytes;
+      }
+    } else {
+      // Wide bit-widths: unpack8 is more efficient
+      int numFullGroups = count / 8;
+      int remaining = count % 8;
+
+      for (int g = 0; g < numFullGroups; g++) {
+        packer.unpack8Values(buf, pos, output, g * 8);
+        pos += bitWidth;
+      }
+
+      if (remaining > 0) {
+        int totalPackedBytes = (count * bitWidth + 7) / 8;
+        int alreadyRead = numFullGroups * bitWidth;
+        int partialBytes = totalPackedBytes - alreadyRead;
+
+        for (int i = 0; i < partialBytes; i++) {
+          unpackByteBuf[i] = buf.get(pos + i);
+        }
+        for (int i = partialBytes; i < bitWidth; i++) {
+          unpackByteBuf[i] = 0;
+        }
+
+        packer.unpack8Values(unpackByteBuf, 0, longUnpackPadBuf, 0);
+        System.arraycopy(longUnpackPadBuf, 0, output, numFullGroups * 8, remaining);
+        pos += partialBytes;
+      }
     }
 
     return pos;
