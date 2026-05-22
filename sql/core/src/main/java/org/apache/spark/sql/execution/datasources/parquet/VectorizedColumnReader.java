@@ -371,6 +371,18 @@ public class VectorizedColumnReader {
       case DELTA_BYTE_ARRAY -> new VectorizedDeltaByteArrayReader();
       case DELTA_LENGTH_BYTE_ARRAY -> new VectorizedDeltaLengthByteArrayReader();
       case DELTA_BINARY_PACKED -> new VectorizedDeltaBinaryPackedReader();
+      case ALP -> {
+        PrimitiveType.PrimitiveTypeName typeName =
+          this.descriptor.getPrimitiveType().getPrimitiveTypeName();
+        if (typeName == PrimitiveType.PrimitiveTypeName.FLOAT) {
+          yield VectorizedAlpValuesReader.forFloat();
+        } else if (typeName == PrimitiveType.PrimitiveTypeName.DOUBLE) {
+          yield VectorizedAlpValuesReader.forDouble();
+        } else {
+          throw new SparkUnsupportedOperationException(
+            "_LEGACY_ERROR_TEMP_3190", Map.of("typeName", typeName.toString()));
+        }
+      }
       case RLE -> {
         PrimitiveType.PrimitiveTypeName typeName =
           this.descriptor.getPrimitiveType().getPrimitiveTypeName();
