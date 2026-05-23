@@ -464,6 +464,241 @@ class ParquetAlpEncodingSuite extends ParquetCompatibilityTest with SharedSparkS
     col.close()
   }
 
+  // ==================== Validation Tests ====================
+
+  test("float: invalid exponent throws ParquetDecodingException") {
+    // Construct a page with exponent=11 (max for float is 10)
+    val page = buildCorruptedFloatPage(exponent = 11, factor = 0, bitWidth = 4, numExceptions = 0)
+    val reader = VectorizedAlpValuesReader.forFloat()
+    reader.initFromPage(8, ByteBufferInputStream.wrap(page))
+    assertThrows[ParquetDecodingException] {
+      reader.readFloat()
+    }
+  }
+
+  test("double: invalid exponent throws ParquetDecodingException") {
+    val page = buildCorruptedDoublePage(exponent = 19, factor = 0, bitWidth = 4, numExceptions = 0)
+    val reader = VectorizedAlpValuesReader.forDouble()
+    reader.initFromPage(8, ByteBufferInputStream.wrap(page))
+    assertThrows[ParquetDecodingException] {
+      reader.readDouble()
+    }
+  }
+
+  test("float: factor > exponent throws ParquetDecodingException") {
+    val page = buildCorruptedFloatPage(exponent = 2, factor = 3, bitWidth = 4, numExceptions = 0)
+    val reader = VectorizedAlpValuesReader.forFloat()
+    reader.initFromPage(8, ByteBufferInputStream.wrap(page))
+    assertThrows[ParquetDecodingException] {
+      reader.readFloat()
+    }
+  }
+
+  test("float: invalid bit width throws ParquetDecodingException") {
+    val page = buildCorruptedFloatPage(exponent = 1, factor = 0, bitWidth = 33, numExceptions = 0)
+    val reader = VectorizedAlpValuesReader.forFloat()
+    reader.initFromPage(8, ByteBufferInputStream.wrap(page))
+    assertThrows[ParquetDecodingException] {
+      reader.readFloat()
+    }
+  }
+
+  test("double: invalid bit width throws ParquetDecodingException") {
+    val page = buildCorruptedDoublePage(exponent = 1, factor = 0, bitWidth = 65, numExceptions = 0)
+    val reader = VectorizedAlpValuesReader.forDouble()
+    reader.initFromPage(8, ByteBufferInputStream.wrap(page))
+    assertThrows[ParquetDecodingException] {
+      reader.readDouble()
+    }
+  }
+
+  test("float: numExceptions > vectorLen throws ParquetDecodingException") {
+    // vectorSize=8, numExceptions=9 (exceeds vector length)
+    val page = buildCorruptedFloatPage(exponent = 1, factor = 0, bitWidth = 4, numExceptions = 9)
+    val reader = VectorizedAlpValuesReader.forFloat()
+    reader.initFromPage(8, ByteBufferInputStream.wrap(page))
+    assertThrows[ParquetDecodingException] {
+      reader.readFloat()
+    }
+  }
+
+  test("float: exception position out of bounds throws ParquetDecodingException") {
+    // Build a page where exception position = 10 but vector length = 8
+    val page = buildFloatPageWithBadExcPosition(excPosition = 10, vectorLen = 8)
+    val reader = VectorizedAlpValuesReader.forFloat()
+    reader.initFromPage(8, ByteBufferInputStream.wrap(page))
+    assertThrows[ParquetDecodingException] {
+      reader.readFloat()
+    }
+  }
+
+  test("float: invalid log vector size in header throws ParquetDecodingException") {
+    // logVectorSize=2 is below MIN_LOG_VECTOR_SIZE=3
+    val page = ByteBuffer.allocate(64).order(ByteOrder.LITTLE_ENDIAN)
+    page.put(0.toByte) // compressionMode
+    page.put(0.toByte) // integerEncoding
+    page.put(2.toByte) // logVectorSize (invalid, below minimum)
+    page.putInt(8) // numElements
+    page.flip()
+    val reader = VectorizedAlpValuesReader.forFloat()
+    assertThrows[ParquetDecodingException] {
+      reader.initFromPage(8, ByteBufferInputStream.wrap(page))
+    }
+  }
+
+  test("float: log vector size 17 exceeds maximum throws ParquetDecodingException") {
+    val page = ByteBuffer.allocate(64).order(ByteOrder.LITTLE_ENDIAN)
+    page.put(0.toByte) // compressionMode
+    page.put(0.toByte) // integerEncoding
+    page.put(17.toByte) // logVectorSize (exceeds max=16)
+    page.putInt(8) // numElements
+    page.flip()
+    val reader = VectorizedAlpValuesReader.forFloat()
+    assertThrows[ParquetDecodingException] {
+      reader.initFromPage(8, ByteBufferInputStream.wrap(page))
+    }
+  }
+
+  // ==================== Helper: Corrupted Page Builders ====================
+
+  /**
+   * Builds a minimal float page with specified (possibly invalid) metadata.
+   * Uses logVectorSize=3 (vectorSize=8) with 8 elements.
+   */
+  private def buildCorruptedFloatPage(
+      exponent: Int,
+      factor: Int,
+      bitWidth: Int,
+      numExceptions: Int): ByteBuffer = {
+    val logVectorSize = 3
+    val numElements = 8
+    val numVectors = 1
+    val offsetArraySize = numVectors * Integer.BYTES
+
+    // Vector data: AlpInfo(4) + ForInfo(5) + packed data (enough zeros)
+    val packedSize = if (bitWidth > 0) (numElements * bitWidth + 7) / 8 else 0
+    val vecDataSize = ALP_INFO_SIZE + FLOAT_FOR_INFO_SIZE + packedSize +
+      numExceptions * (java.lang.Short.BYTES + java.lang.Float.BYTES)
+    val pageSize = ALP_HEADER_SIZE + offsetArraySize + vecDataSize
+    val page = ByteBuffer.allocate(pageSize).order(ByteOrder.LITTLE_ENDIAN)
+
+    // Header
+    page.put(0.toByte) // compressionMode
+    page.put(0.toByte) // integerEncoding
+    page.put(logVectorSize.toByte)
+    page.putInt(numElements)
+
+    // Offset array
+    page.putInt(offsetArraySize)
+
+    // AlpInfo
+    page.put(exponent.toByte)
+    page.put(factor.toByte)
+    page.putShort(numExceptions.toShort)
+
+    // ForInfo
+    page.putInt(0) // frameOfReference
+    page.put(bitWidth.toByte)
+
+    // Fill remaining with zeros (packed data + any exception data)
+    while (page.hasRemaining) page.put(0.toByte)
+
+    page.flip()
+    page
+  }
+
+  /**
+   * Builds a minimal double page with specified (possibly invalid) metadata.
+   */
+  private def buildCorruptedDoublePage(
+      exponent: Int,
+      factor: Int,
+      bitWidth: Int,
+      numExceptions: Int): ByteBuffer = {
+    val logVectorSize = 3
+    val numElements = 8
+    val numVectors = 1
+    val offsetArraySize = numVectors * Integer.BYTES
+
+    val packedSize = if (bitWidth > 0) (numElements * bitWidth + 7) / 8 else 0
+    val vecDataSize = ALP_INFO_SIZE + DOUBLE_FOR_INFO_SIZE + packedSize +
+      numExceptions * (java.lang.Short.BYTES + java.lang.Double.BYTES)
+    val pageSize = ALP_HEADER_SIZE + offsetArraySize + vecDataSize
+    val page = ByteBuffer.allocate(pageSize).order(ByteOrder.LITTLE_ENDIAN)
+
+    // Header
+    page.put(0.toByte)
+    page.put(0.toByte)
+    page.put(logVectorSize.toByte)
+    page.putInt(numElements)
+
+    // Offset array
+    page.putInt(offsetArraySize)
+
+    // AlpInfo
+    page.put(exponent.toByte)
+    page.put(factor.toByte)
+    page.putShort(numExceptions.toShort)
+
+    // ForInfo
+    page.putLong(0L) // frameOfReference
+    page.put(bitWidth.toByte)
+
+    // Fill remaining with zeros
+    while (page.hasRemaining) page.put(0.toByte)
+
+    page.flip()
+    page
+  }
+
+  /**
+   * Builds a float page with one exception whose position is out of bounds.
+   */
+  private def buildFloatPageWithBadExcPosition(excPosition: Int, vectorLen: Int): ByteBuffer = {
+    val logVectorSize = 3 // vectorSize=8
+    val numElements = vectorLen
+    val numVectors = 1
+    val offsetArraySize = numVectors * Integer.BYTES
+    val bitWidth = 4
+    val numExceptions = 1
+
+    val packedSize = (numElements * bitWidth + 7) / 8
+    val vecDataSize = ALP_INFO_SIZE + FLOAT_FOR_INFO_SIZE + packedSize +
+      numExceptions * (java.lang.Short.BYTES + java.lang.Float.BYTES)
+    val pageSize = ALP_HEADER_SIZE + offsetArraySize + vecDataSize
+    val page = ByteBuffer.allocate(pageSize).order(ByteOrder.LITTLE_ENDIAN)
+
+    // Header
+    page.put(0.toByte)
+    page.put(0.toByte)
+    page.put(logVectorSize.toByte)
+    page.putInt(numElements)
+
+    // Offset array
+    page.putInt(offsetArraySize)
+
+    // AlpInfo
+    page.put(1.toByte) // exponent
+    page.put(0.toByte) // factor
+    page.putShort(numExceptions.toShort)
+
+    // ForInfo
+    page.putInt(0) // frameOfReference
+    page.put(bitWidth.toByte)
+
+    // Packed data (zeros)
+    for (_ <- 0 until packedSize) page.put(0.toByte)
+
+    // Exception position (out of bounds)
+    page.putShort(excPosition.toShort)
+
+    // Exception value
+    page.putInt(java.lang.Float.floatToRawIntBits(Float.NaN))
+
+    page.flip()
+    page
+  }
+
   // ==================== Helper: Fast Rounding ====================
 
   private def fastRoundFloat(value: Float): Int = {

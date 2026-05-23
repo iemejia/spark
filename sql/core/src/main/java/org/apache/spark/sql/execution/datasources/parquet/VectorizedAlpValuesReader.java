@@ -62,7 +62,11 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
   private static final int ALP_COMPRESSION_MODE = 0;
   private static final int ALP_INTEGER_ENCODING_FOR = 0;
   private static final int MIN_LOG_VECTOR_SIZE = 3;
-  private static final int MAX_LOG_VECTOR_SIZE = 15;
+  private static final int MAX_LOG_VECTOR_SIZE = 16;
+  private static final int FLOAT_MAX_EXPONENT = 10;
+  private static final int DOUBLE_MAX_EXPONENT = 18;
+  private static final int FLOAT_MAX_BIT_WIDTH = 32;
+  private static final int DOUBLE_MAX_BIT_WIDTH = 64;
 
   // Powers of 10 for float encode/decode
   private static final float[] FLOAT_POW10 = {
@@ -338,10 +342,29 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
     int numExceptions = vectorsData.getShort(pos + 2) & 0xFFFF;
     pos += ALP_INFO_SIZE;
 
+    if (exponent > FLOAT_MAX_EXPONENT) {
+      throw new ParquetDecodingException(
+          "Invalid ALP float exponent: " + exponent + ", max is " + FLOAT_MAX_EXPONENT);
+    }
+    if (factor > exponent) {
+      throw new ParquetDecodingException(
+          "Invalid ALP float factor: " + factor + ", must be <= exponent (" + exponent + ")");
+    }
+    if (numExceptions > vectorLen) {
+      throw new ParquetDecodingException(
+          "Invalid ALP float exception count: " + numExceptions +
+          ", exceeds vector length " + vectorLen);
+    }
+
     // ForInfo: frameOfReference(4 LE) + bitWidth(1)
     int frameOfReference = vectorsData.getInt(pos);
     int bitWidth = vectorsData.get(pos + 4) & 0xFF;
     pos += FLOAT_FOR_INFO_SIZE;
+
+    if (bitWidth > FLOAT_MAX_BIT_WIDTH) {
+      throw new ParquetDecodingException(
+          "Invalid ALP float bit width: " + bitWidth + ", max is " + FLOAT_MAX_BIT_WIDTH);
+    }
 
     // Unpack bit-packed deltas and decode
     float pow10f = FLOAT_POW10[factor];
@@ -360,7 +383,13 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
     // Apply exceptions: overwrite positions with raw float values
     if (numExceptions > 0) {
       for (int e = 0; e < numExceptions; e++) {
-        excPositionsBuffer[e] = vectorsData.getShort(pos) & 0xFFFF;
+        int excPos = vectorsData.getShort(pos) & 0xFFFF;
+        if (excPos >= vectorLen) {
+          throw new ParquetDecodingException(
+              "Invalid ALP float exception position: " + excPos +
+              ", must be < vector length " + vectorLen);
+        }
+        excPositionsBuffer[e] = excPos;
         pos += Short.BYTES;
       }
       for (int e = 0; e < numExceptions; e++) {
@@ -384,10 +413,29 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
     int numExceptions = vectorsData.getShort(pos + 2) & 0xFFFF;
     pos += ALP_INFO_SIZE;
 
+    if (exponent > DOUBLE_MAX_EXPONENT) {
+      throw new ParquetDecodingException(
+          "Invalid ALP double exponent: " + exponent + ", max is " + DOUBLE_MAX_EXPONENT);
+    }
+    if (factor > exponent) {
+      throw new ParquetDecodingException(
+          "Invalid ALP double factor: " + factor + ", must be <= exponent (" + exponent + ")");
+    }
+    if (numExceptions > vectorLen) {
+      throw new ParquetDecodingException(
+          "Invalid ALP double exception count: " + numExceptions +
+          ", exceeds vector length " + vectorLen);
+    }
+
     // ForInfo: frameOfReference(8 LE) + bitWidth(1)
     long frameOfReference = vectorsData.getLong(pos);
     int bitWidth = vectorsData.get(pos + 8) & 0xFF;
     pos += DOUBLE_FOR_INFO_SIZE;
+
+    if (bitWidth > DOUBLE_MAX_BIT_WIDTH) {
+      throw new ParquetDecodingException(
+          "Invalid ALP double bit width: " + bitWidth + ", max is " + DOUBLE_MAX_BIT_WIDTH);
+    }
 
     // Unpack bit-packed deltas and decode
     double pow10f = DOUBLE_POW10[factor];
@@ -406,7 +454,13 @@ public class VectorizedAlpValuesReader extends VectorizedReaderBase {
     // Apply exceptions: overwrite positions with raw double values
     if (numExceptions > 0) {
       for (int e = 0; e < numExceptions; e++) {
-        excPositionsBuffer[e] = vectorsData.getShort(pos) & 0xFFFF;
+        int excPos = vectorsData.getShort(pos) & 0xFFFF;
+        if (excPos >= vectorLen) {
+          throw new ParquetDecodingException(
+              "Invalid ALP double exception position: " + excPos +
+              ", must be < vector length " + vectorLen);
+        }
+        excPositionsBuffer[e] = excPos;
         pos += Short.BYTES;
       }
       for (int e = 0; e < numExceptions; e++) {
